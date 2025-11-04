@@ -45,7 +45,7 @@ Edit `config.json` with your details:
 
 ```json
 {
-  "email": "htorres00@icloud.com",
+  "email": "mail0@icloud.com",
   "password": "your-app-specific-password-here",
   "imap_server": "imap.mail.me.com",
   "imap_port": 993,
@@ -136,7 +136,7 @@ This is the mail system at host icloud.com.
 I'm sorry to have to inform you that your message could not
 be delivered to one or more recipients.
 
-<htorres00@icloud.com>: host mail.icloud.com said: 550 5.1.1
+<email@icloud.com>: host mail.icloud.com said: 550 5.1.1
 Recipient address rejected: User unknown in local recipient table
 ```
 
