@@ -41,6 +41,7 @@ tail -f logs/spam_bouncer_*.log
 ## Done! 🎉
 
 The script is now running in the background and will:
+- Monitor **all configured email accounts** (iCloud, Gmail, etc.)
 - Check for spam every 5 minutes
 - Send fake bounce messages to spammers
 - Move spam to Junk folder

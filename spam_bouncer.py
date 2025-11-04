@@ -36,6 +36,7 @@ class SpamBouncer:
 
     def __init__(self, config_file='config.json'):
         self.config = self._load_config(config_file)
+        self.accounts = self._normalize_accounts(self.config)
         self.processed_file = LOG_DIR / 'processed_emails.txt'
         self.processed_ids = self._load_processed()
 
@@ -45,10 +46,23 @@ class SpamBouncer:
         if not config_path.exists():
             raise FileNotFoundError(
                 f"Config file not found: {config_path}\n"
-                "Please create config.json with your iCloud credentials."
+                "Please create config.json with your email credentials."
             )
         with open(config_path) as f:
             return json.load(f)
+
+    def _normalize_accounts(self, config):
+        """Normalize config to always be a list of accounts (backward compatibility)"""
+        # New format: {"accounts": [...]}
+        if 'accounts' in config:
+            return [acc for acc in config['accounts'] if acc.get('enabled', True)]
+
+        # Old format: {"email": "...", "password": "..."}
+        if 'email' in config:
+            logger.warning("Using legacy config format. Please update to new multi-account format.")
+            return [config]
+
+        raise ValueError("Invalid config format. Must have 'accounts' array or legacy 'email' field.")
 
     def _load_processed(self):
         """Load list of already processed email IDs"""
@@ -138,30 +152,30 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
         """Extract domain from email address"""
         return email_address.split('@')[-1] if '@' in email_address else 'icloud.com'
 
-    def connect_imap(self):
-        """Connect to IMAP server"""
+    def connect_imap(self, account):
+        """Connect to IMAP server for a specific account"""
         try:
-            logger.info("Connecting to IMAP server...")
-            mail = imaplib.IMAP4_SSL(self.config['imap_server'], self.config.get('imap_port', 993))
-            mail.login(self.config['email'], self.config['password'])
-            logger.info("Successfully connected to IMAP")
+            logger.info(f"Connecting to IMAP server for {account['email']}...")
+            mail = imaplib.IMAP4_SSL(account['imap_server'], account.get('imap_port', 993))
+            mail.login(account['email'], account['password'])
+            logger.info(f"Successfully connected to IMAP for {account['email']}")
             return mail
         except Exception as e:
-            logger.error(f"IMAP connection failed: {e}")
+            logger.error(f"IMAP connection failed for {account['email']}: {e}")
             raise
 
-    def send_bounce(self, to_address, original_subject, recipient):
-        """Send fake bounce message"""
+    def send_bounce(self, account, to_address, original_subject, recipient):
+        """Send fake bounce message from a specific account"""
         try:
-            logger.info(f"Sending bounce to: {to_address}")
+            logger.info(f"Sending bounce to: {to_address} from {account['email']}")
 
             # Create bounce message
             bounce_msg = self._create_bounce_message(to_address, original_subject, recipient)
 
             # Connect to SMTP and send
-            with smtplib.SMTP(self.config['smtp_server'], self.config.get('smtp_port', 587)) as server:
+            with smtplib.SMTP(account['smtp_server'], account.get('smtp_port', 587)) as server:
                 server.starttls()
-                server.login(self.config['email'], self.config['password'])
+                server.login(account['email'], account['password'])
                 server.send_message(bounce_msg)
 
             logger.info(f"Bounce sent successfully to {to_address}")
@@ -171,27 +185,27 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
             logger.error(f"Failed to send bounce to {to_address}: {e}")
             return False
 
-    def process_spam(self):
-        """Check for spam emails and send bounce messages"""
+    def process_account_spam(self, account):
+        """Check for spam emails and send bounce messages for a specific account"""
         mail = None
         try:
-            mail = self.connect_imap()
+            mail = self.connect_imap(account)
             mail.select('INBOX')
 
             # Search for unread spam messages
-            # Looking for messages with X-Clx-Spam: true header
+            # Looking for messages with X-Clx-Spam: true or spam headers
             status, messages = mail.search(None, 'UNSEEN')
 
             if status != 'OK':
-                logger.error("Failed to search for messages")
+                logger.error(f"Failed to search for messages in {account['email']}")
                 return
 
             if not messages or not messages[0]:
-                logger.info("No unread messages found")
+                logger.info(f"No unread messages found in {account['email']}")
                 return
 
             email_ids = messages[0].split()
-            logger.info(f"Found {len(email_ids)} unread messages to check")
+            logger.info(f"Found {len(email_ids)} unread messages to check in {account['email']}")
 
             for email_id in email_ids:
                 try:
@@ -205,9 +219,12 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
                     msg = email.message_from_bytes(raw_email)
 
                     # Check if it's spam
+                    # Gmail uses X-Spam-Flag, iCloud uses X-Clx-Spam
                     is_spam = (
                         msg.get('X-Clx-Spam', '').lower() == 'true' or
-                        msg.get('X-Proofpoint-Spam-Details', '') != ''
+                        msg.get('X-Proofpoint-Spam-Details', '') != '' or
+                        msg.get('X-Spam-Flag', '').lower() == 'yes' or
+                        msg.get('X-Gmail-Labels', '').lower().find('spam') != -1
                     )
 
                     if not is_spam:
@@ -217,7 +234,16 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
                     # Get sender info
                     from_header = msg.get('From', '')
                     subject = msg.get('Subject', '(No Subject)')
-                    message_id = msg.get('Message-ID', email_id.decode() if isinstance(email_id, bytes) else str(email_id))
+
+                    # Generate fallback message ID from email_id
+                    if isinstance(email_id, bytes):
+                        fallback_id = email_id.decode()
+                    elif isinstance(email_id, int):
+                        fallback_id = str(email_id)
+                    else:
+                        fallback_id = str(email_id)
+
+                    message_id = msg.get('Message-ID', fallback_id)
 
                     # Skip if already processed
                     if message_id in self.processed_ids:
@@ -234,14 +260,14 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
                     logger.info(f"Processing spam from: {from_email} - Subject: {subject}")
 
                     # Send bounce
-                    if self.send_bounce(from_email, subject, self.config['email']):
+                    if self.send_bounce(account, from_email, subject, account['email']):
                         self._mark_processed(message_id)
                         logger.info(f"Successfully bounced spam from {from_email}")
 
                         # Move to Junk folder
                         try:
-                            # Try common spam folder names
-                            spam_folders = ['Junk', 'Spam', 'INBOX.Junk', 'INBOX.Spam']
+                            # Try common spam folder names (Gmail uses [Gmail]/Spam)
+                            spam_folders = ['Junk', 'Spam', '[Gmail]/Spam', 'INBOX.Junk', 'INBOX.Spam']
                             moved = False
 
                             for folder_name in spam_folders:
@@ -263,11 +289,13 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
                             logger.error(f"Error moving email to spam folder: {e}")
 
                 except Exception as e:
+                    import traceback
                     logger.error(f"Error processing email {email_id}: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     continue
 
         except Exception as e:
-            logger.error(f"Error in process_spam: {e}")
+            logger.error(f"Error in process_account_spam for {account['email']}: {e}")
             raise
         finally:
             if mail:
@@ -278,6 +306,19 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
                     mail.logout()
                 except:
                     pass
+
+    def process_spam(self):
+        """Check for spam emails across all configured accounts"""
+        logger.info(f"Processing {len(self.accounts)} account(s)")
+
+        for account in self.accounts:
+            try:
+                logger.info(f"--- Checking account: {account['email']} ---")
+                self.process_account_spam(account)
+            except Exception as e:
+                logger.error(f"Failed to process account {account['email']}: {e}")
+                # Continue with next account even if this one fails
+                continue
 
     def run_once(self):
         """Run a single check cycle"""

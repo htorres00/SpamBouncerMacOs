@@ -11,26 +11,37 @@ Automatically reply to spam emails with convincing fake bounce messages to disco
 
 ## Features
 
+- ✅ **Multi-account support** - Monitor multiple email accounts (iCloud, Gmail, etc.)
 - ✅ Convincing fake bounce messages with realistic SMTP error codes (550, 551, 553)
 - ✅ Random bounce reasons to appear natural
 - ✅ Automatically moves spam to Junk folder after bouncing
 - ✅ Tracks processed emails to avoid duplicates within sessions
 - ✅ Comprehensive logging with automatic cleanup
 - ✅ Daily log compression (older than 1 day) and 30-day retention
+- ✅ Spam detection for both iCloud (X-Clx-Spam) and Gmail (X-Spam-Flag) headers
 - ✅ Can run once or continuously
 - ✅ Launch Agent support for automatic background operation
 
 ## Setup Instructions
 
-### 1. Create iCloud App-Specific Password
+### 1. Create App-Specific Passwords
 
-Since you're using iCloud, you need an app-specific password:
+#### For iCloud:
 
 1. Go to [appleid.apple.com](https://appleid.apple.com)
 2. Sign in and go to **Security** section
 3. Under **App-Specific Passwords**, click **Generate Password**
-4. Name it "Spam Bouncer" or similar
+4. Name it "Spam Bouncer"
 5. Copy the generated password (format: xxxx-xxxx-xxxx-xxxx)
+
+#### For Gmail:
+
+1. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+2. Sign in with your Google account
+3. Create app password named "Spam Bouncer"
+4. Copy the 16-character password (format: xxxx xxxx xxxx xxxx - remove spaces)
+
+**Note**: Gmail requires 2-Step Verification to be enabled first.
 
 ### 2. Configure the Script
 
@@ -41,20 +52,36 @@ cd "/Users/hector/TIM Dropbox/Hector Torres/Apps/spam-email"
 cp config.json.template config.json
 ```
 
-Edit `config.json` with your details:
+Edit `config.json` with your accounts:
 
 ```json
 {
-  "email": "mail0@icloud.com",
-  "password": "your-app-specific-password-here",
-  "imap_server": "imap.mail.me.com",
-  "imap_port": 993,
-  "smtp_server": "smtp.mail.me.com",
-  "smtp_port": 587
+  "accounts": [
+    {
+      "email": "your-email@icloud.com",
+      "password": "your-icloud-app-password",
+      "imap_server": "imap.mail.me.com",
+      "imap_port": 993,
+      "smtp_server": "smtp.mail.me.com",
+      "smtp_port": 587,
+      "enabled": true
+    },
+    {
+      "email": "your-email@gmail.com",
+      "password": "your-gmail-app-password",
+      "imap_server": "imap.gmail.com",
+      "imap_port": 993,
+      "smtp_server": "smtp.gmail.com",
+      "smtp_port": 587,
+      "enabled": true
+    }
+  ]
 }
 ```
 
-**⚠️ Important**: Never commit `config.json` to version control (it contains your password).
+You can add as many accounts as needed, or remove accounts you don't want to monitor.
+
+**⚠️ Important**: Never commit `config.json` to version control (it contains your passwords).
 
 ### 3. Test the Script
 
