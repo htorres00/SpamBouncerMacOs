@@ -77,6 +77,79 @@ class SpamBouncer:
             f.write(f"{email_id}\n")
         self.processed_ids.add(email_id)
 
+    def _is_spam(self, msg):
+        """
+        Comprehensive spam detection based on headers and patterns.
+        Returns True if email appears to be spam.
+        """
+        import re
+
+        # 1. Check existing spam headers first
+        if (msg.get('X-Clx-Spam', '').lower() == 'true' or
+            msg.get('X-Proofpoint-Spam-Details', '') != '' or
+            msg.get('X-Spam-Flag', '').lower() == 'yes' or
+            msg.get('X-Gmail-Labels', '').lower().find('spam') != -1):
+            return True
+
+        # 2. Get sender information
+        from_header = msg.get('From', '')
+        from_email = email.utils.parseaddr(from_header)[1].lower()
+        from_domain = from_email.split('@')[-1] if '@' in from_email else ''
+
+        # 3. Suspicious sender patterns
+        # Random string usernames (e.g., skunklunarlit450@icloud.com)
+        username = from_email.split('@')[0] if '@' in from_email else ''
+
+        # Pattern: random words + numbers (common spam pattern)
+        random_pattern = re.search(r'^[a-z]+[a-z0-9]{6,}[0-9]+$', username)
+        if random_pattern:
+            logger.debug(f"Spam indicator: Random username pattern in {from_email}")
+            return True
+
+        # 4. Suspicious iCloud senders
+        # Real users rarely have very long random usernames
+        if from_domain == 'icloud.com' and len(username) > 15:
+            if re.search(r'[0-9]{3,}', username):  # Contains 3+ consecutive numbers
+                logger.debug(f"Spam indicator: Suspicious iCloud username {from_email}")
+                return True
+
+        # 5. Check Subject for spam patterns
+        subject = msg.get('Subject', '')
+        if subject.lower() == '(no subject)' or subject.strip() == '':
+            # No subject with suspicious sender is often spam
+            if random_pattern:
+                logger.debug(f"Spam indicator: No subject + random sender")
+                return True
+
+        # 6. Check body/preview for common spam patterns
+        body_preview = msg.get_payload()
+        if isinstance(body_preview, str):
+            body_lower = body_preview.lower()
+            spam_keywords = [
+                'adjust', 'chrysalides', 'capillament', 'demetrius',
+                'click here', 'verify your account', 'suspended',
+                'urgent action required', 'confirm your identity'
+            ]
+            keyword_matches = sum(1 for keyword in spam_keywords if keyword in body_lower)
+            if keyword_matches >= 2:
+                logger.debug(f"Spam indicator: {keyword_matches} spam keywords found")
+                return True
+
+        # 7. Missing authentication headers (SPF, DKIM, DMARC failures)
+        auth_results = msg.get('Authentication-Results', '').lower()
+        if 'spf=fail' in auth_results or 'dkim=fail' in auth_results:
+            logger.debug(f"Spam indicator: Authentication failure")
+            return True
+
+        # 8. Suspicious To/Reply-To mismatches
+        to_header = msg.get('To', '').lower()
+        reply_to = msg.get('Reply-To', '').lower()
+        if reply_to and reply_to != from_email and from_domain != reply_to.split('@')[-1]:
+            logger.debug(f"Spam indicator: Reply-To mismatch")
+            return True
+
+        return False
+
     def _create_bounce_message(self, original_from, original_subject, recipient):
         """Create a convincing fake bounce/NDR message"""
 
@@ -109,9 +182,11 @@ class SpamBouncer:
 
         # Create the bounce message
         msg = MIMEMultipart('mixed')
-        msg['From'] = f'Mail Delivery System <MAILER-DAEMON@{self._get_domain(recipient)}>'
+        # Use actual email address but with "Mail Delivery System" display name
+        # (iCloud/Gmail won't let us impersonate MAILER-DAEMON)
+        msg['From'] = f'Mail Delivery System <{recipient}>'
         msg['To'] = original_from
-        msg['Subject'] = f'Mail delivery failed: returning message to sender'
+        msg['Subject'] = f'Undelivered Mail Returned to Sender'
         msg['Date'] = formatdate(localtime=True)
         msg['Message-ID'] = make_msgid(domain=self._get_domain(recipient))
         msg['Auto-Submitted'] = 'auto-replied'
@@ -209,25 +284,70 @@ Diagnostic-Code: smtp; {bounce['code']} {bounce['title']}
 
             for email_id in email_ids:
                 try:
-                    # Fetch the email
-                    status, msg_data = mail.fetch(email_id, '(RFC822)')
+                    # Fetch the email using BODY[] (more reliable than RFC822)
+                    status, msg_data = mail.fetch(email_id, '(BODY[])')
                     if status != 'OK':
+                        logger.warning(f"Failed to fetch email {email_id}")
                         continue
 
-                    # Parse email
-                    raw_email = msg_data[0][1]
+                    # Validate msg_data structure
+                    if not msg_data or len(msg_data) == 0:
+                        logger.warning(f"Empty msg_data for email {email_id}")
+                        continue
+
+                    # Parse email - handle different response formats
+                    # msg_data can be: [(b'1 (RFC822 {size}', email_bytes), b')')] or similar
+                    raw_email = None
+
+                    # Try to find the email data in msg_data
+                    for item in msg_data:
+                        if isinstance(item, tuple) and len(item) >= 2:
+                            if isinstance(item[1], bytes) and len(item[1]) > 100:  # Actual email should be bigger
+                                raw_email = item[1]
+                                break
+
+                    # If not found in tuples, check direct items
+                    if raw_email is None and len(msg_data) > 0:
+                        if isinstance(msg_data[0], tuple) and len(msg_data[0]) > 1:
+                            potential = msg_data[0][1]
+                            if isinstance(potential, bytes) and len(potential) > 100:
+                                raw_email = potential
+
+                    # Ensure raw_email is valid bytes
+                    if raw_email is None:
+                        logger.warning(f"Could not extract email data for {email_id}, marking as seen to prevent loop")
+                        # Mark as seen so it doesn't keep showing up
+                        try:
+                            mail.store(email_id, '+FLAGS', '\\Seen')
+                        except:
+                            pass
+                        continue
+                    elif isinstance(raw_email, int):
+                        logger.error(f"Got integer instead of bytes for email {email_id}, marking as seen")
+                        try:
+                            mail.store(email_id, '+FLAGS', '\\Seen')
+                        except:
+                            pass
+                        continue
+                    elif not isinstance(raw_email, bytes):
+                        logger.error(f"Unexpected raw_email type for {email_id}: {type(raw_email)}, marking as seen")
+                        try:
+                            mail.store(email_id, '+FLAGS', '\\Seen')
+                        except:
+                            pass
+                        continue
+                    elif len(raw_email) < 50:
+                        logger.warning(f"Email {email_id} too small ({len(raw_email)} bytes), marking as seen")
+                        try:
+                            mail.store(email_id, '+FLAGS', '\\Seen')
+                        except:
+                            pass
+                        continue
+
                     msg = email.message_from_bytes(raw_email)
 
-                    # Check if it's spam
-                    # Gmail uses X-Spam-Flag, iCloud uses X-Clx-Spam
-                    is_spam = (
-                        msg.get('X-Clx-Spam', '').lower() == 'true' or
-                        msg.get('X-Proofpoint-Spam-Details', '') != '' or
-                        msg.get('X-Spam-Flag', '').lower() == 'yes' or
-                        msg.get('X-Gmail-Labels', '').lower().find('spam') != -1
-                    )
-
-                    if not is_spam:
+                    # Check if it's spam using comprehensive detection
+                    if not self._is_spam(msg):
                         logger.debug(f"Email {email_id} is not spam, skipping")
                         continue
 
